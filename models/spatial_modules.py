@@ -8,12 +8,12 @@ from functools import partial
 from timm.layers import DropPath
 try:
     from .shared_modules import RelativePositionBias, ContinuousPositionBias1D, MLP
+    from .time_modules import AttentionBlock1d
 except:
     from shared_modules import RelativePositionBias, ContinuousPositionBias1D, MLP
-    
+    from time_modules import AttentionBlock1d
 
 # Param builder func
-
     
 def build_space_block(params):
     if params.space_type == 'axial_attention':
@@ -37,6 +37,23 @@ class RMSInstanceNorm2d(nn.Module):
         x = (x) / (std + self.eps)
         if self.affine:
             x = x * self.weight[None, :, None, None]  
+        return x
+    
+
+class RMSInstanceNorm1d(nn.Module):
+    def __init__(self, dim, affine=True, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.affine = affine
+        if affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+            self.bias = nn.Parameter(torch.zeros(dim)) # Forgot to remove this so its in the pretrained weights
+    
+    def forward(self, x):
+        std, mean = torch.std_mean(x, dim=(-1), keepdims=True)
+        x = (x) / (std + self.eps)
+        if self.affine:
+            x = x * self.weight[None, :, None]  
         return x
 
     
@@ -190,4 +207,56 @@ class AxialAttentionBlock(nn.Module):
         x = self.mlp_norm(x)
         output = input + self.drop_path(self.gamma_mlp[None, :, None, None] * x)
 
-        return output
+
+
+class hMLP_stem1d(nn.Module):
+    """ Image to Patch Embedding
+    """
+    def __init__(self, patch_size=(16,16), in_chans=3, embed_dim =768):
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.in_proj = torch.nn.Sequential(
+            *[nn.Conv1d(in_chans, embed_dim//4, kernel_size=4, stride=4, bias=False),
+            RMSInstanceNorm1d(embed_dim//4, affine=True),
+            nn.GELU(),
+            nn.Conv1d(embed_dim//4, embed_dim//4, kernel_size=2, stride=2, bias=False),
+            RMSInstanceNorm1d(embed_dim//4, affine=True),
+            nn.GELU(),
+            nn.Conv1d(embed_dim//4, embed_dim, kernel_size=2, stride=2, bias=False),
+            RMSInstanceNorm1d(embed_dim, affine=True),
+            ]
+            )
+    
+    def forward(self, x):
+        x = self.in_proj(x)
+        return x
+    
+    
+class hMLP_output1d(nn.Module):
+    """ Patch to Image De-bedding
+    """
+    def __init__(self, patch_size=(16,16), out_chans=3, embed_dim=768):
+        super().__init__()
+        self.patch_size = patch_size
+        self.out_chans = out_chans
+        self.embed_dim = embed_dim
+        self.out_proj = torch.nn.Sequential(
+            *[nn.ConvTranspose1d(embed_dim, embed_dim//4, kernel_size=2, stride=2, bias=False),
+            RMSInstanceNorm1d(embed_dim//4, affine=True),
+            nn.GELU(),
+            nn.ConvTranspose1d(embed_dim//4, embed_dim//4, kernel_size=2, stride=2, bias=False),
+            RMSInstanceNorm1d(embed_dim//4, affine=True),
+            nn.GELU(),
+            ])
+        out_head = nn.ConvTranspose1d(embed_dim//4, out_chans, kernel_size=4, stride=4)
+        self.out_kernel = nn.Parameter(out_head.weight)
+        self.out_bias = nn.Parameter(out_head.bias)
+    
+    def forward(self, x,):# state_labels):
+        x = self.out_proj(x)#.flatten(2).transpose(1, 2)
+        #print('out proj', x.shape)
+        x = F.conv_transpose1d(x, self.out_kernel, self.out_bias, stride=4) #self.out_kernel[:, state_labels], self.out_bias[state_labels]
+        #print('conv transpose1d', x.shape)
+        return x
