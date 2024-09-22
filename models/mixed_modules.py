@@ -7,11 +7,11 @@ from functools import partial
 from torch.utils.checkpoint import checkpoint
 import math
 try:
-    from spatial_modules import build_space_block
-    from time_modules import build_time_block, AttentionBlock
+    from spatial_modules import build_space_block, SpatialAttentionBlock1d
+    from time_modules import build_time_block, AttentionBlock, AttentionBlock1d
 except:
-    from .spatial_modules import build_space_block
-    from .time_modules import build_time_block, AttentionBlock
+    from .spatial_modules import build_space_block, SpatialAttentionBlock1d
+    from .time_modules import build_time_block, AttentionBlock, AttentionBlock1d
 
 def build_spacetime_block(params):
     """
@@ -67,5 +67,47 @@ class SpaceTimeBlock(nn.Module):
         else:
             x = self.spatial(x, bcs) # Convnext has the residual in the block
         x = rearrange(x, '(t b) c h w -> t b c h w', t=T) 
+
+        return x
+
+
+class SpaceTimeBlock1d(nn.Module):
+    """
+    Alternates spatial and temporal processing. Current code base uses
+    1D attention over each axis. Spatial axes share weights.
+
+    Note: MLP is in spatial block. 
+    """
+    def __init__(self, hidden_dim=512, num_heads=8, drop_path=0., space_override=None, time_override=None,
+                    gradient_checkpointing=False):
+        super().__init__()
+        self.gradient_checkpointing = gradient_checkpointing
+
+        self.spatial = SpatialAttentionBlock1d(hidden_dim, num_heads, drop_path=drop_path)
+
+        self.temporal = AttentionBlock1d(hidden_dim, num_heads, drop_path=drop_path)
+
+    def forward(self, x):
+        # input is t x b x c x h x w 
+        T, B, C, H = x.shape
+
+        # Time attention
+        if self.gradient_checkpointing:
+            # kwargs seem to need to be passed explicitly
+            wrapped_temporal = partial(self.temporal)
+            x = checkpoint(wrapped_temporal, x, use_reentrant=False)
+        else:
+            x = self.temporal(x) # Residual in block
+        # Temporal handles the rearrange so still is t x b x c x h x w 
+
+        # Now do spatial attention
+        x = rearrange(x, 't b c h -> (t b) c h')
+        if self.gradient_checkpointing:
+            # kwargs seem to need to be passed explicitly 
+            wrapped_spatial = partial(self.spatial)
+            x = checkpoint(wrapped_spatial, x, bcs, use_reentrant=False)
+        else:
+            x = self.spatial(x) # Convnext has the residual in the block
+        x = rearrange(x, '(t b) c h -> t b c h', t=T) 
 
         return x
